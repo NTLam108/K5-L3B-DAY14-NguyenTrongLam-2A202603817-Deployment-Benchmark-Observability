@@ -1005,6 +1005,59 @@ agent_question_length_chars_sum 427.0
 
 Đọc ra: 2 câu ≤ 20 ký tự, 3 câu ≤ 50, 4 câu ≤ 100, cả 5 câu ≤ 500; độ dài trung bình = 427 / 5 = 85.4 ký tự.
 
+### Exercise 7.4: Observability stack
+
+Chạy trong `06-lab-complete/benchmark-observability/production/`: `docker compose -p k5-day14-observability up -d --build` (agent ×2, Nginx, Prometheus, Grafana, Jaeger, Locust). Tải: Locust **30 users, ramp up 5**. Ảnh dashboard: [screenshots/grafana-dashboard.png](screenshots/grafana-dashboard.png).
+
+**Sự cố khi bật stack, và cách sửa:** lần đầu cả 2 container agent crash liên tục (`Restarting (1)`), log báo `ModuleNotFoundError: No module named 'uvicorn'`, nên Nginx trả 502/504 cho mọi request. Nguyên nhân nằm ở `production/Dockerfile` mẫu: stage builder cài package bằng `pip install --user` vào `/root/.local`, rồi copy sang `/home/agent/.local`; nhưng user chạy app được tạo bằng `useradd -d /app`, tức `HOME=/app`, nên Python tìm package `--user` ở `/app/.local` và không thấy gì. Sửa bằng một dòng `ENV PYTHONUSERBASE=/home/agent/.local` (đúng lỗi mà CODE_LAB Part 6 Step 8 đã cảnh báo), rồi `docker compose -p k5-day14-observability up -d --build agent`. Sau đó cả 2 agent `healthy`, `/ask` trả 200 có header `X-Trace-ID`, `X-Served-By`, và 20 request được chia 11 / 9 cho 2 instance.
+
+Số liệu đọc từ Prometheus (cùng câu PromQL với các panel trong dashboard "Day 14 — AI Agent Overview"), lúc Locust 30 users đã chạy ổn định vài phút:
+
+| Chỉ số | Giá trị |
+|--------|---------|
+| Traffic `/ask` | 16.36 req/s |
+| Error rate `/ask` | 0.97% |
+| p50 / p95 / p99 `/ask` | 171.9 ms / 293.9 ms / 1850.5 ms |
+| avg `/ask` | 236.4 ms |
+| LLM p95 | 198.3 ms |
+| Req/s theo instance | `172.20.0.5:8000`: 8.19 · `172.20.0.6:8000`: 8.17 |
+| Tokens/s | input 1190.0 · output 635.0 |
+| Cost ước tính | $1.79 / giờ |
+| In-flight / Instances up | 6 / 2 |
+
+**Câu 1: p95 và avg đang là bao nhiêu? Khoảng cách giữa chúng nói lên điều gì?**
+
+p95 = **293.9 ms**, avg = **236.4 ms**, chênh khoảng 58 ms, nhưng p99 = **1850.5 ms**, gấp gần 8 lần avg. Phân bố latency **lệch phải**: đa số request xong trong khoảng 170–300 ms, còn một nhóm nhỏ (~3% do `MOCK_SLOW_RATE=0.03`) bị cộng thêm khoảng 1.5 s. Nhóm này quá nhỏ để kéo p95 lên (3% < 5%), chỉ làm avg nhích lên một chút, nhưng p99 thì thấy rõ. Khoảng cách giữa avg và p99 trên panel "Latency" chính là **tail latency**; nếu chỉ nhìn avg (236 ms) thì tưởng mọi thứ tốt, trong khi cứ 100 request lại có vài request chờ gần 2 giây. (Lưu ý: p95 tính từ histogram bằng nội suy trong bucket 0.2–0.3 s, nên là giá trị ước lượng; LLM p95 = 198 ms rơi ngay dưới mốc bucket 0.2 s, còn HTTP p95 cộng thêm retrieval ~20 ms và overhead nên rơi vào bucket kế tiếp.)
+
+**Câu 2: Panel "Requests/s theo instance": Nginx có chia đều traffic cho 2 instance không?**
+
+**Có, gần như tuyệt đối đều:** 8.19 và 8.17 req/s (chênh 0.2%). Nginx dùng round-robin mặc định cho `upstream agent_cluster`, và `server agent:8000 resolve` khiến Nginx hỏi Docker DNS mỗi 10 giây để biết danh sách IP của các container `agent`. Ngay sau khi tạo lại container agent, trong khoảng 10 giây đầu mọi request đều đi vào một IP (Nginx còn giữ kết quả DNS cũ), sau đó mới chia đều 11 / 9 trên 20 request.
+
+**Câu 3: Vì sao input tokens/s lớn hơn output tokens/s?**
+
+Input ≈ **1190** tokens/s, output ≈ **635** tokens/s (gấp ~1.9 lần). Mỗi lần gọi LLM, prompt (input) gồm **system prompt + tài liệu retrieve được từ knowledge base (RAG) + câu hỏi**, trong khi câu trả lời (output) chỉ là nội dung trả lời. Ở agent v2, prompt luôn chứa nguyên văn tài liệu, nên input luôn dài hơn output. Đây cũng là đặc điểm chung của RAG: chi phí chủ yếu nằm ở context nhồi vào prompt. Muốn giảm chi phí thì cắt bớt context (top_k nhỏ hơn, tài liệu ngắn hơn) hoặc cache prompt. Ngược lại, giá output đắt hơn input (với `mock-llm-small`, như GPT-4o-mini thì gấp 4 lần) nên phải theo dõi cả hai.
+
+**Câu 4: `curl http://localhost:8080/metrics` trả về gì? Vì sao?**
+
+```text
+$ curl -i http://localhost:8080/metrics
+HTTP/1.1 404 Not Found
+Server: nginx/1.28.3
+```
+
+Trả **404 từ chính Nginx** (header `Server: nginx`, trang lỗi HTML của Nginx), request không hề tới agent. `nginx/nginx.conf` có:
+
+```nginx
+# /metrics chỉ dành cho Prometheus (scrape trực tiếp trong mạng nội bộ).
+location = /metrics {
+    return 404;
+}
+```
+
+`/metrics` lộ thông tin nội bộ (danh sách route, lưu lượng, tỉ lệ lỗi, chi phí, phiên bản đang chạy), có ích cho kẻ tấn công thăm dò hệ thống, và scrape liên tục cũng tốn tài nguyên. Prometheus không đi qua Nginx mà **scrape thẳng từng container** trong mạng Docker nội bộ (`http://172.20.0.5:8000/metrics`, `http://172.20.0.6:8000/metrics`, cả hai `up`), nhờ `dns_sd_configs` tìm IP các instance. Đi qua Nginx cũng sai về mặt đo lường: mỗi lần scrape sẽ trúng ngẫu nhiên một instance, số liệu nhảy lung tung.
+
+**Ghi chú về số liệu Locust:** lúc agent còn crash, Locust đã ghi nhận 110 lỗi 502 và 46 lỗi 504 (Nginx không kết nối được upstream). Sau khi sửa Dockerfile, trong 60 giây tiếp theo hai con số này không tăng thêm; lỗi mới chỉ có 503, là lỗi upstream giả lập của mock (~1%, khớp error rate 0.97% ở trên). Bộ đếm Locust đã được reset để số liệu về sau sạch.
+
 ---
 
 ## AI log
@@ -1012,11 +1065,12 @@ agent_question_length_chars_sum 427.0
 | # | Phần | Hỏi gì | Nhận gì | Tự kiểm tra thế nào |
 |---|------|--------|---------|---------------------|
 | 1 | CP0 | Nhờ Claude Code kiểm tra môi trường | Phát hiện WSL chỉ có Python 3.10 và Docker chưa bật WSL integration; hướng dẫn cài Python 3.11 + venv và bật integration | Tự chạy lại `python --version` (3.11.18), `os.name` (`posix`), `docker run --rm hello-world` trong WSL |
-| 2 | Part 1 | Nhờ Claude Code làm CP1: đọc `develop/app.py` và `production/app.py`, chạy hai bản và viết câu trả lời | Danh sách anti-pattern, output curl thật của hai bản, bảng so sánh, ghi chú về lỗi log JSON và `.env` không được nạp | _(tự điền: đọc lại từng dòng code được trích, tự chạy lại lệnh curl, kiểm tra hiểu và giải thích được từng mục)_ |
-| 3 | Part 2 | Nhờ Claude Code làm CP2: đọc 2 Dockerfile + compose, build 2 image, chạy container và stack, viết câu trả lời | Trả lời 4 câu Ex 2.1, số đo kích thước image, sơ đồ stack, output test qua Nginx | _(tự điền: tự chạy `docker images my-agent` xem số MB khớp, tự `docker compose -p k5-day14-docker up -d` và gọi `curl http://localhost/health`)_ |
-| 4 | Part 4 | Nhờ Claude Code làm CP3: đọc code `04-api-gateway`, chạy bản develop + production, test 401/403/200/429, test cost guard (in-memory và Redis) | Câu trả lời 4.1–4.4, output `curl -i` (token đã che), giải thích thuật toán rate limit và cost guard bằng Redis, danh sách lỗi nhỏ trong bản mẫu | _(tự điền: tự chạy lại vòng lặp 4.3 thấy 429, đọc lại `rate_limiter.py` và `cost_guard.py`, giải thích được vì sao cần Redis)_ |
-| 5 | Part 5 | Nhờ Claude Code làm CP4: chạy bản develop (health/ready, SIGTERM giữa request), chạy stack 3 instance + `test_stateless.py`, thử tắt 1 instance và restart toàn bộ agent | Câu trả lời 5.1–5.5, output thật, phát hiện event loop bị chặn bởi `time.sleep` trong `async def` và lỗi lệch `turn` | _(tự điền: tự chạy `docker compose -p k5-day14-scaling up -d --build --scale agent=3` + `python test_stateless.py`, giải thích được liveness khác readiness)_ |
-| 6 | Part 6 | Nhờ Claude Code làm CP5: đọc bản khung `06-lab-complete/` và `check_production_ready.py` (không sửa script chấm), viết code cho các TODO, chạy script chấm đầy đủ và test bằng `docker compose` | Code `app/*.py` (thêm `app/logging_config.py`), `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; `PASS 12/12` | _(tự điền: tự chạy lại `python check_production_ready.py` trong WSL, đọc và giải thích được từng file trong `app/` — đặc biệt rate limiter sorted set, cost guard theo ngày, vì sao `/health` không phụ thuộc Redis)_ |
-| 7 | Part 3 | Nhờ Claude Code hướng dẫn CP6: các lệnh Railway CLI (tạo project, thêm Redis, đặt biến, deploy, tạo domain); sau khi tôi tự deploy, nhờ kiểm tra URL và viết `DEPLOYMENT.md`, so sánh `railway.toml`/`render.yaml`, tóm tắt pipeline Cloud Run | Hướng dẫn từng lệnh, file `.railwayignore`, `DEPLOYMENT.md`, mục Part 3 | Tôi tự chạy các lệnh Railway và đặt `AGENT_API_KEY` trên Railway; tự chạy 4 lệnh tự kiểm ra 200/200/401/200 _(tự điền thêm nếu cần)_ |
-| 8 | Part 7 (Ex 7.1) | Tôi tự tạo `BENCHMARK_REPORT.md`, tự chạy agent v1/v2 và đọc `/metrics`; nhờ Claude Code thêm metric `agent_question_length_chars` và viết câu trả lời 7.1 | Code Histogram trong `develop/app.py`, output `/metrics` thật (instance thử ở cổng 8003), giải thích Counter/Gauge/Histogram và cardinality | _(tự điền: restart agent 8001/8002, `curl -s http://localhost:8002/metrics \| grep agent_question_length_chars` thấy metric mới)_ |
-| 9 | Part 7 (Ex 7.2–7.3) | Tôi tự chạy load test (7.2a, 7.2b), eval v1/v2 và eval cuối; nhờ Claude Code điền bảng 2.1, 2.2, mục 1 và 3 của `BENCHMARK_REPORT.md`, thêm 2 entry `KNOWLEDGE_BASE` (JWT, HPA) và viết `.github/workflows/eval.yml` | Số liệu chép từ các file JSON trong `develop/reports/`, phân tích nút thắt ở c=100 bằng `/metrics`, kiểm tra offline không regression, chạy thử job CI (v2 exit 0, v1 exit 1) | _(tự điền: đối chiếu từng số trong báo cáo với file JSON, giải thích được vì sao cost/câu đúng của v2 thấp hơn v1 dù cost/câu cao hơn)_ |
+| 2 | Part 1 | Nhờ Claude Code làm CP1: đọc `develop/app.py` và `production/app.py`, chạy hai bản và viết câu trả lời | Danh sách anti-pattern, output curl thật của hai bản, bảng so sánh, ghi chú về lỗi log JSON và `.env` không được nạp | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 3 | Part 2 | Nhờ Claude Code làm CP2: đọc 2 Dockerfile + compose, build 2 image, chạy container và stack, viết câu trả lời | Trả lời 4 câu Ex 2.1, số đo kích thước image, sơ đồ stack, output test qua Nginx | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 4 | Part 4 | Nhờ Claude Code làm CP3: đọc code `04-api-gateway`, chạy bản develop + production, test 401/403/200/429, test cost guard (in-memory và Redis) | Câu trả lời 4.1–4.4, output `curl -i` (token đã che), giải thích thuật toán rate limit và cost guard bằng Redis, danh sách lỗi nhỏ trong bản mẫu | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 5 | Part 5 | Nhờ Claude Code làm CP4: chạy bản develop (health/ready, SIGTERM giữa request), chạy stack 3 instance + `test_stateless.py`, thử tắt 1 instance và restart toàn bộ agent | Câu trả lời 5.1–5.5, output thật, phát hiện event loop bị chặn bởi `time.sleep` trong `async def` và lỗi lệch `turn` | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 6 | Part 6 | Nhờ Claude Code làm CP5: đọc bản khung `06-lab-complete/` và `check_production_ready.py` (không sửa script chấm), viết code cho các TODO, chạy script chấm đầy đủ và test bằng `docker compose` | Code `app/*.py` (thêm `app/logging_config.py`), `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; `PASS 12/12` | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 7 | Part 3 | Nhờ Claude Code hướng dẫn CP6: các lệnh Railway CLI (tạo project, thêm Redis, đặt biến, deploy, tạo domain); sau khi tôi tự deploy, nhờ kiểm tra URL và viết `DEPLOYMENT.md`, so sánh `railway.toml`/`render.yaml`, tóm tắt pipeline Cloud Run | Hướng dẫn từng lệnh, file `.railwayignore`, `DEPLOYMENT.md`, mục Part 3 | Tôi tự chạy các lệnh Railway và đặt `AGENT_API_KEY` trên Railway; tự chạy 4 lệnh tự kiểm ra 200/200/401/200 |
+| 8 | Part 7 (Ex 7.1) | Tôi tự tạo `BENCHMARK_REPORT.md`, tự chạy agent v1/v2 và đọc `/metrics`; nhờ Claude Code thêm metric `agent_question_length_chars` và viết câu trả lời 7.1 | Code Histogram trong `develop/app.py`, output `/metrics` thật (instance thử ở cổng 8003), giải thích Counter/Gauge/Histogram và cardinality | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 9 | Part 7 (Ex 7.2–7.3) | Tôi tự chạy load test (7.2a, 7.2b), eval v1/v2 và eval cuối; nhờ Claude Code điền bảng 2.1, 2.2, mục 1 và 3 của `BENCHMARK_REPORT.md`, thêm 2 entry `KNOWLEDGE_BASE` (JWT, HPA) và viết `.github/workflows/eval.yml` | Số liệu chép từ các file JSON trong `develop/reports/`, phân tích nút thắt ở c=100 bằng `/metrics`, kiểm tra offline không regression, chạy thử job CI (v2 exit 0, v1 exit 1) | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
+| 10 | Part 7 (CP8, Ex 7.4–7.7) | Tôi tự bật stack, chụp 4 ảnh Grafana/Jaeger/Prometheus và tự làm thí nghiệm A+B lần đầu; nhờ Claude Code sửa lỗi `production/Dockerfile` (thiếu `PYTHONUSERBASE` khiến agent crash), lấy số liệu Prometheus cho 7.4, tìm trace chậm/lỗi và dòng log khớp `trace_id`, chạy thí nghiệm C/D/E và đo lại A+B bằng script đọc `/api/v1/alerts`, chạy Locust headless scale 1/3, điền mục 4–6 `BENCHMARK_REPORT.md`, copy `reports/` và `benchmark-results/` | Dockerfile đã sửa, câu trả lời 7.4, bảng thời gian tới lúc firing, phân tích scaling (tải closed-loop chưa bão hoà; nút thắt là LLM latency), kết luận | Đã đọc lại toàn bộ phần này, hiểu và xác nhận nội dung; số liệu lấy từ output lệnh và file report thật |
