@@ -940,6 +940,73 @@ INFO:     Finished server process [9]
 
 ---
 
+## Part 7: Benchmark & Observability
+
+Số liệu benchmark (load test, eval, scaling) nằm trong [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md). Mục này ghi câu trả lời các câu hỏi không có chỗ trong mẫu báo cáo.
+
+### Exercise 7.1: Đọc metrics của agent
+
+Chạy `AGENT_VERSION=v1 PORT=8001 python app.py` và `AGENT_VERSION=v2 PORT=8002 python app.py` trong `06-lab-complete/benchmark-observability/develop/`. Output bên dưới lấy từ một instance v2 chạy thêm ở cổng 8003 **sau khi đã thêm metric mới**, gồm 5 câu hỏi và 5 URL lạ:
+
+```text
+$ curl -s -X POST http://localhost:8003/ask -H "Content-Type: application/json" -d '{"question": "Prometheus thu thập metrics như thế nào?"}'
+{"answer":"Prometheus pull metrics bằng cách scrape endpoint /metrics theo chu kỳ. Counter chỉ tăng (đếm request), Gauge lên xuống (request đang xử lý), Histogram chia latency vào các bucket để tính percentile bằng histogram_quantile.","model":"mock-llm-small","agent_version":"v2","usage":{"input_tokens":91,"output_tokens":55,"cost_usd":4.665e-05},"llm_latency_ms":165.0,"request_id":"ac9e5b998d3e"}
+```
+
+**Câu 1: Ví dụ cho mỗi loại metric** (`curl -s http://localhost:8003/metrics | grep -v "^#"`):
+
+| Loại | Ví dụ trong output | Ý nghĩa |
+|------|--------------------|---------|
+| **Counter**: chỉ tăng, về 0 khi restart | `http_requests_total{method="POST",route="/ask",status="200"} 5.0`<br>`llm_tokens_total{model="mock-llm-small",type="input"} 330.0`<br>`llm_cost_usd_total{model="mock-llm-small"} 0.0001425` | Đếm tích luỹ. Muốn biết "bao nhiêu mỗi giây" thì dùng `rate(http_requests_total[1m])` trong Prometheus |
+| **Gauge**: lên xuống tuỳ ý | `agent_in_flight_requests 0.0`<br>`agent_info{model="mock-llm-small",version="v2"} 1.0` | Giá trị tức thời: số request đang xử lý (lúc scrape không có request nào nên = 0). `agent_info` là gauge luôn = 1, chỉ dùng label để biết version/model đang chạy |
+| **Histogram**: đếm quan sát theo bucket | `http_request_duration_seconds_bucket{le="0.2",method="POST",route="/ask"} 5.0`<br>`http_request_duration_seconds_count{method="POST",route="/ask"} 5.0`<br>`http_request_duration_seconds_sum{method="POST",route="/ask"} 0.9036801570036914` | Mỗi bucket `le="x"` đếm số request có latency ≤ x giây (bucket **cộng dồn**). Có `_count` và `_sum` nên tính được trung bình (0.904 / 5 = 181 ms) và percentile bằng `histogram_quantile(0.95, rate(..._bucket[5m]))` |
+
+**Câu 2: Vì sao dùng `route.path` thay vì `request.url.path` làm label `route`.**
+
+Mỗi tổ hợp giá trị label khác nhau là **một time series riêng** mà Prometheus phải lưu trong RAM. Tôi gửi 5 URL lạ giống bot quét (`/wp-admin`, `/.env`, `/a1b2c3`, `/admin/config.php`, `/xyz123`), cả 5 đều 404 và **gộp vào một series**:
+
+```text
+http_requests_total{method="GET",route="unmatched",status="404"} 5.0
+http_request_duration_seconds_count{method="GET",route="unmatched"} 5.0
+```
+
+Nếu dùng URL thật, mỗi URL lạ sinh ra 1 series cho counter **cộng thêm 14 series** cho histogram (12 bucket + `_count` + `_sum`), tức **15 series mỗi URL**. Bot quét 10,000 URL thì có thêm khoảng **150,000 series**. Đây là **cardinality bùng nổ**: Prometheus hết RAM, query chậm, dashboard treo, và kẻ tấn công có thể cố ý gây ra (DoS vào hệ thống giám sát). Dùng route template (`/ask`, `/health`, hoặc `unmatched`) thì số series là hữu hạn và biết trước, bất kể client gọi URL gì. Cùng lý do đó, không bao giờ dùng `user_id`, `request_id` hay nội dung câu hỏi làm label.
+
+**Nhiệm vụ: thêm metric `agent_question_length_chars`** (`develop/app.py`):
+
+```python
+QUESTION_LENGTH = Histogram(
+    "agent_question_length_chars", "Độ dài câu hỏi gửi tới /ask (ký tự)",
+    buckets=(20, 50, 100, 200, 500, 1000, 2000),
+)
+
+# trong ask(), trước khi gọi LLM:
+QUESTION_LENGTH.observe(len(body.question))
+```
+
+- **Dùng Histogram, không dùng label `length=...`**, vì độ dài câu hỏi có vô số giá trị (1 đến 2000), làm label sẽ gây đúng vấn đề cardinality ở câu 2. Histogram chỉ tạo đúng 10 series cố định (8 bucket + `_count` + `_sum`).
+- Bucket chọn theo giới hạn `max_length=2000` của `AskRequest`.
+- Đặt **trước** khi gọi LLM, để cả request bị lỗi LLM cũng được đếm.
+
+Kết quả sau 5 câu hỏi dài 2, 13, 40, 97 và 275 ký tự (tổng 427):
+
+```text
+agent_question_length_chars_bucket{le="20.0"} 2.0
+agent_question_length_chars_bucket{le="50.0"} 3.0
+agent_question_length_chars_bucket{le="100.0"} 4.0
+agent_question_length_chars_bucket{le="200.0"} 4.0
+agent_question_length_chars_bucket{le="500.0"} 5.0
+agent_question_length_chars_bucket{le="1000.0"} 5.0
+agent_question_length_chars_bucket{le="2000.0"} 5.0
+agent_question_length_chars_bucket{le="+Inf"} 5.0
+agent_question_length_chars_count 5.0
+agent_question_length_chars_sum 427.0
+```
+
+Đọc ra: 2 câu ≤ 20 ký tự, 3 câu ≤ 50, 4 câu ≤ 100, cả 5 câu ≤ 500; độ dài trung bình = 427 / 5 = 85.4 ký tự.
+
+---
+
 ## AI log
 
 | # | Phần | Hỏi gì | Nhận gì | Tự kiểm tra thế nào |
@@ -951,3 +1018,5 @@ INFO:     Finished server process [9]
 | 5 | Part 5 | Nhờ Claude Code làm CP4: chạy bản develop (health/ready, SIGTERM giữa request), chạy stack 3 instance + `test_stateless.py`, thử tắt 1 instance và restart toàn bộ agent | Câu trả lời 5.1–5.5, output thật, phát hiện event loop bị chặn bởi `time.sleep` trong `async def` và lỗi lệch `turn` | _(tự điền: tự chạy `docker compose -p k5-day14-scaling up -d --build --scale agent=3` + `python test_stateless.py`, giải thích được liveness khác readiness)_ |
 | 6 | Part 6 | Nhờ Claude Code làm CP5: đọc bản khung `06-lab-complete/` và `check_production_ready.py` (không sửa script chấm), viết code cho các TODO, chạy script chấm đầy đủ và test bằng `docker compose` | Code `app/*.py` (thêm `app/logging_config.py`), `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; `PASS 12/12` | _(tự điền: tự chạy lại `python check_production_ready.py` trong WSL, đọc và giải thích được từng file trong `app/` — đặc biệt rate limiter sorted set, cost guard theo ngày, vì sao `/health` không phụ thuộc Redis)_ |
 | 7 | Part 3 | Nhờ Claude Code hướng dẫn CP6: các lệnh Railway CLI (tạo project, thêm Redis, đặt biến, deploy, tạo domain); sau khi tôi tự deploy, nhờ kiểm tra URL và viết `DEPLOYMENT.md`, so sánh `railway.toml`/`render.yaml`, tóm tắt pipeline Cloud Run | Hướng dẫn từng lệnh, file `.railwayignore`, `DEPLOYMENT.md`, mục Part 3 | Tôi tự chạy các lệnh Railway và đặt `AGENT_API_KEY` trên Railway; tự chạy 4 lệnh tự kiểm ra 200/200/401/200 _(tự điền thêm nếu cần)_ |
+| 8 | Part 7 (Ex 7.1) | Tôi tự tạo `BENCHMARK_REPORT.md`, tự chạy agent v1/v2 và đọc `/metrics`; nhờ Claude Code thêm metric `agent_question_length_chars` và viết câu trả lời 7.1 | Code Histogram trong `develop/app.py`, output `/metrics` thật (instance thử ở cổng 8003), giải thích Counter/Gauge/Histogram và cardinality | _(tự điền: restart agent 8001/8002, `curl -s http://localhost:8002/metrics \| grep agent_question_length_chars` thấy metric mới)_ |
+| 9 | Part 7 (Ex 7.2–7.3) | Tôi tự chạy load test (7.2a, 7.2b), eval v1/v2 và eval cuối; nhờ Claude Code điền bảng 2.1, 2.2, mục 1 và 3 của `BENCHMARK_REPORT.md`, thêm 2 entry `KNOWLEDGE_BASE` (JWT, HPA) và viết `.github/workflows/eval.yml` | Số liệu chép từ các file JSON trong `develop/reports/`, phân tích nút thắt ở c=100 bằng `/metrics`, kiểm tra offline không regression, chạy thử job CI (v2 exit 0, v1 exit 1) | _(tự điền: đối chiếu từng số trong báo cáo với file JSON, giải thích được vì sao cost/câu đúng của v2 thấp hơn v1 dù cost/câu cao hơn)_ |
