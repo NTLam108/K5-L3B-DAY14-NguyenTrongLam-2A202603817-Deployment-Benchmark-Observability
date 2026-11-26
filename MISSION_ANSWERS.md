@@ -1011,7 +1011,9 @@ Chạy trong `06-lab-complete/benchmark-observability/production/`: `docker comp
 
 **Sự cố khi bật stack, và cách sửa:** lần đầu cả 2 container agent crash liên tục (`Restarting (1)`), log báo `ModuleNotFoundError: No module named 'uvicorn'`, nên Nginx trả 502/504 cho mọi request. Nguyên nhân nằm ở `production/Dockerfile` mẫu: stage builder cài package bằng `pip install --user` vào `/root/.local`, rồi copy sang `/home/agent/.local`; nhưng user chạy app được tạo bằng `useradd -d /app`, tức `HOME=/app`, nên Python tìm package `--user` ở `/app/.local` và không thấy gì. Sửa bằng một dòng `ENV PYTHONUSERBASE=/home/agent/.local` (đúng lỗi mà CODE_LAB Part 6 Step 8 đã cảnh báo), rồi `docker compose -p k5-day14-observability up -d --build agent`. Sau đó cả 2 agent `healthy`, `/ask` trả 200 có header `X-Trace-ID`, `X-Served-By`, và 20 request được chia 11 / 9 cho 2 instance.
 
-Số liệu đọc từ Prometheus (cùng câu PromQL với các panel trong dashboard "Day 14 — AI Agent Overview"), lúc Locust 30 users đã chạy ổn định vài phút:
+**Đọc từ ảnh [`grafana-dashboard.png`](screenshots/grafana-dashboard.png)** (hàng Golden Signals, Last 15 minutes): Traffic **16.1 req/s**, Error rate **1.32%**, Latency p95 **290.26 ms**, Saturation (in-flight) **5**, Instances up **2**, LLM cost (1h) **$0.2048**. Panel "Requests/s theo instance": 2 đường `172.20.0.5:8000` và `172.20.0.6:8000` chồng gần như trùng nhau, mỗi đường ~8 req/s. Panel "Latency /ask": p50/p95/avg nằm sát nhau quanh 0.2–0.3 s, còn p99 tách hẳn lên ~1.8 s.
+
+Số liệu chi tiết hơn đọc trực tiếp từ Prometheus (cùng câu PromQL với các panel), lúc Locust 30 users đã chạy ổn định vài phút:
 
 | Chỉ số | Giá trị |
 |--------|---------|
